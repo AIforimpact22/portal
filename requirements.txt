@@ -1,0 +1,11 @@
+# UI + data
+streamlit==1.45.0
+pandas
+
+# Direct psycopg2 import in pages/1_Create_Database.py (use wheel to avoid pg_config issues)
+psycopg2-binary>=2.9.10
+
+# Cloud SQL connector stack used by DatabaseManager (pg8000 driver)
+cloud-sql-python-connector[pg8000]>=1.11.1
+pg8000>=1.31.2
+google-auth>=2.30.0
