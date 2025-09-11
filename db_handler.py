@@ -1,16 +1,17 @@
 import os
+import json
 import uuid
 import pandas as pd
 import streamlit as st
 
 # Cloud SQL Python Connector (PostgreSQL via pg8000)
-from google.cloud.sql.connector import Connector
-from google.oauth2 import service_account  # ← explicit creds for off-GCP
+from google.cloud.sql.connector import Connector, IPTypes
+from google.oauth2 import service_account  # explicit creds for off-GCP
 import pg8000  # ensure driver is installed
 
 
 # ───────────────────────────────────────────────────────────────
-# 1) One cached Connector + connection per user session
+# Helpers: session key & credentials
 # ───────────────────────────────────────────────────────────────
 def _session_key() -> str:
     """Return a unique key for the current user session."""
@@ -19,6 +20,46 @@ def _session_key() -> str:
     return st.session_state["_session_key"]
 
 
+def _load_explicit_credentials():
+    """
+    Build service-account Credentials from one of:
+      1) st.secrets["gcp_service_account"] (dict)  ← Streamlit preferred
+      2) st.secrets["GCP_SA_KEY_JSON"] (string with JSON)
+      3) env var GCP_SA_KEY_JSON (string with JSON)
+      4) env var GOOGLE_APPLICATION_CREDENTIALS (file path)
+    Returns a google.oauth2.service_account.Credentials or raises ValueError.
+    """
+    # 1) Streamlit secret as a dict-like block
+    if "gcp_service_account" in st.secrets:
+        info = dict(st.secrets["gcp_service_account"])
+        return service_account.Credentials.from_service_account_info(info)
+
+    # 2) Streamlit secret JSON string
+    if "GCP_SA_KEY_JSON" in st.secrets:
+        info = json.loads(st.secrets["GCP_SA_KEY_JSON"])
+        return service_account.Credentials.from_service_account_info(info)
+
+    # 3) Env var JSON string
+    if os.getenv("GCP_SA_KEY_JSON"):
+        info = json.loads(os.environ["GCP_SA_KEY_JSON"])
+        return service_account.Credentials.from_service_account_info(info)
+
+    # 4) Env var file path
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        return service_account.Credentials.from_service_account_file(
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+        )
+
+    raise ValueError(
+        "No service account credentials found. Provide one of: "
+        "st.secrets['gcp_service_account'], st.secrets['GCP_SA_KEY_JSON'], "
+        "env GCP_SA_KEY_JSON, or env GOOGLE_APPLICATION_CREDENTIALS."
+    )
+
+
+# ───────────────────────────────────────────────────────────────
+# 1) One cached Connector + connection per user session
+# ───────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def get_conn(cfg: dict, key: str):
     """
@@ -30,20 +71,17 @@ def get_conn(cfg: dict, key: str):
       - user: DB user (e.g. "postgres")
       - password: raw DB password (NO URL encoding)
       - db: database name
-    Also expects either:
-      - st.secrets["gcp_service_account"] block with a service account JSON
-        OR
-      - GOOGLE_APPLICATION_CREDENTIALS env var pointing to a key file
+      - ip_type: "PUBLIC" or "PRIVATE" (optional, default PUBLIC)
+      - universe_domain: e.g. "googleapis.com" (optional; defaults connector)
     """
-    # Load explicit credentials if provided in Streamlit secrets
-    creds = None
-    if "gcp_service_account" in st.secrets:
-        creds = service_account.Credentials.from_service_account_info(
-            dict(st.secrets["gcp_service_account"])
-        )
+    # Always pass explicit credentials to avoid metadata lookups off-GCP
+    creds = _load_explicit_credentials()
 
-    # If creds is None and ADC is configured via env, Connector will pick it up.
-    connector = Connector(credentials=creds) if creds else Connector()
+    connector = Connector(
+        credentials=creds,
+        # Set if you saw a "universe domain mismatch"; safe default is googleapis.com
+        universe_domain=cfg.get("universe_domain", "googleapis.com"),
+    )
 
     def _connect():
         conn = connector.connect(
@@ -52,8 +90,11 @@ def get_conn(cfg: dict, key: str):
             user=cfg["user"],
             password=cfg["password"],
             db=cfg["db"],
-            timeout=10,            # connect timeout (seconds)
-            enable_iam_auth=False, # using DB password auth (not IAM DB Auth)
+            timeout=10,             # connect timeout (seconds)
+            enable_iam_auth=False,  # using DB password auth (not IAM DB Auth)
+            ip_type=IPTypes.PRIVATE
+            if str(cfg.get("ip_type", "PUBLIC")).upper() == "PRIVATE"
+            else IPTypes.PUBLIC,
         )
         # Per-session statement timeout (5s) so no query can hang the UI
         cur = conn.cursor()
@@ -76,7 +117,7 @@ def get_conn(cfg: dict, key: str):
                 connector.close()
             except Exception:
                 pass
-        st.on_session_end(_cleanup)
+        st.on_session_end(_cleanup)  # no-op on some hosts; guarded above
     except Exception:
         pass
 
@@ -91,16 +132,29 @@ class DatabaseManager:
     """General DB interactions using a cached connection (Cloud SQL Connector)."""
 
     def __init__(self):
-        # Prefer env vars (Cloud Run/App Engine); fallback to Streamlit secrets.
+        # Prefer env vars; fallback to Streamlit secrets.
+        cloudsql = st.secrets.get("cloudsql", {})
         cfg = {
             "instance_connection_name": os.getenv(
                 "INSTANCE_CONNECTION_NAME",
-                st.secrets["cloudsql"]["instance_connection_name"],
+                cloudsql.get("instance_connection_name", ""),
             ),
-            "user": os.getenv("DB_USER", st.secrets["cloudsql"]["user"]),
-            "password": os.getenv("DB_PASSWORD", st.secrets["cloudsql"]["password"]),
-            "db": os.getenv("DB_NAME", st.secrets["cloudsql"]["db"]),
+            "user": os.getenv("DB_USER", cloudsql.get("user", "")),
+            # Your password may include a double-quote; keep it raw.
+            "password": os.getenv("DB_PASSWORD", cloudsql.get("password", "")),
+            "db": os.getenv("DB_NAME", cloudsql.get("db", "")),
+            "ip_type": os.getenv("CLOUDSQL_IP_TYPE", cloudsql.get("ip_type", "PUBLIC")),
+            "universe_domain": os.getenv(
+                "UNIVERSE_DOMAIN",
+                cloudsql.get("universe_domain", "googleapis.com"),
+            ),
         }
+
+        # Minimal validation
+        missing = [k for k in ("instance_connection_name", "user", "password", "db") if not cfg.get(k)]
+        if missing:
+            raise ValueError(f"Missing DB config values: {', '.join(missing)}")
+
         self.cfg = cfg
         self._key = _session_key()
         self.conn = get_conn(self.cfg, self._key)  # cached per user session
@@ -115,20 +169,16 @@ class DatabaseManager:
         self.conn = get_conn(self.cfg, self._key)
 
     def _ensure_live_conn(self):
-        """
-        Ensure we have a live connection. Quick ping; if it fails, reconnect.
-        """
+        """Ensure we have a live connection. Quick ping; if it fails, reconnect."""
         try:
             cur = self.conn.cursor()
             try:
-                # Make the ping return fast even if server is busy
                 cur.execute("SET LOCAL statement_timeout = 2000;")
                 cur.execute("SELECT 1;")
                 _ = cur.fetchone()
             finally:
                 cur.close()
         except Exception:
-            # Stale/broken connection → rebuild
             self._reconnect()
 
     def _fetch_df(self, query: str, params=None) -> pd.DataFrame:
@@ -136,7 +186,6 @@ class DatabaseManager:
         try:
             cur = self.conn.cursor()
             try:
-                # Per-query timeout safeguard (8s)
                 cur.execute("SET LOCAL statement_timeout = 8000;")
                 cur.execute(query, params or ())
                 rows = cur.fetchall()
@@ -145,7 +194,6 @@ class DatabaseManager:
                 cur.close()
             return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
         except Exception:
-            # On any driver/connector hiccup → one reconnect + retry once
             self._reconnect()
             cur = self.conn.cursor()
             try:
@@ -170,7 +218,6 @@ class DatabaseManager:
             self.conn.commit()
             return res
         except Exception:
-            # Reconnect and retry once
             self._reconnect()
             cur = self.conn.cursor()
             try:
