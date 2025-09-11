@@ -1,6 +1,8 @@
 import os
+import re
 import json
 import uuid
+import base64
 import pandas as pd
 import streamlit as st
 
@@ -11,7 +13,7 @@ import pg8000  # ensure driver is installed
 
 
 # ───────────────────────────────────────────────────────────────
-# Helpers: session key & credentials
+# Helpers: session key
 # ───────────────────────────────────────────────────────────────
 def _session_key() -> str:
     """Return a unique key for the current user session."""
@@ -20,6 +22,71 @@ def _session_key() -> str:
     return st.session_state["_session_key"]
 
 
+# ───────────────────────────────────────────────────────────────
+# PEM cleanup & validation (fixes InvalidByte(..., 61))
+# ───────────────────────────────────────────────────────────────
+_PEM_HDR = "-----BEGIN PRIVATE KEY-----"
+_PEM_FTR = "-----END PRIVATE KEY-----"
+
+def _clean_pem_block(pem: str) -> str:
+    """
+    Return a normalized PEM string with:
+      - exact header/footer lines,
+      - no leading spaces on Base64 lines,
+      - LF line endings,
+      - validated Base64 body length (multiple of 4).
+    Raises ValueError with a clear hint if malformed.
+    """
+    if not isinstance(pem, str) or _PEM_HDR not in pem or _PEM_FTR not in pem:
+        raise ValueError("Service account private_key is missing a valid PEM block.")
+
+    # Normalize newlines
+    pem = pem.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Extract body
+    m = re.search(rf"{re.escape(_PEM_HDR)}\n(.*)\n{re.escape(_PEM_FTR)}", pem, re.S)
+    if not m:
+        raise ValueError("PEM block must have header, body, and footer on separate lines.")
+
+    body = m.group(1)
+
+    # Remove any leading/trailing spaces on base64 lines
+    lines = [ln.strip() for ln in body.split("\n") if ln.strip()]
+
+    # Join to raw base64 and validate padding/length
+    b64 = "".join(lines)
+    if len(b64) % 4 != 0:
+        # Classic copy/paste corruption; this is what triggers InvalidByte(..., 61)
+        raise ValueError(
+            f"PEM appears corrupted: Base64 length {len(b64)} is not divisible by 4. "
+            "Re-copy the private key from the JSON file (no edits/extra characters)."
+        )
+    try:
+        # Decode to ensure characters are valid. Validate padding as well.
+        base64.b64decode(b64, validate=True)
+    except Exception as e:
+        raise ValueError(f"PEM base64 is invalid: {e}")
+
+    # Reassemble with LF only and a trailing newline (common tooling expects it)
+    clean = _PEM_HDR + "\n"
+    # Keep 64-char wrapping for readability (optional)
+    wrap = 64
+    clean += "\n".join(b64[i : i + wrap] for i in range(0, len(b64), wrap)) + "\n"
+    clean += _PEM_FTR + "\n"
+    return clean
+
+
+def _normalize_sa_info(info: dict) -> dict:
+    """Return a copy of service account info with a cleaned PEM."""
+    info = dict(info)  # shallow copy
+    if "private_key" in info and isinstance(info["private_key"], str):
+        info["private_key"] = _clean_pem_block(info["private_key"])
+    return info
+
+
+# ───────────────────────────────────────────────────────────────
+# Credentials loader (accepts Streamlit secrets or envs)
+# ───────────────────────────────────────────────────────────────
 def _load_explicit_credentials():
     """
     Build service-account Credentials from one of:
@@ -29,26 +96,45 @@ def _load_explicit_credentials():
       4) env var GOOGLE_APPLICATION_CREDENTIALS (file path)
     Returns a google.oauth2.service_account.Credentials or raises ValueError.
     """
+    try_sources = []
+
     # 1) Streamlit secret as a dict-like block
     if "gcp_service_account" in st.secrets:
-        info = dict(st.secrets["gcp_service_account"])
-        return service_account.Credentials.from_service_account_info(info)
+        try_sources.append(("st.secrets['gcp_service_account']", dict(st.secrets["gcp_service_account"])))
 
     # 2) Streamlit secret JSON string
     if "GCP_SA_KEY_JSON" in st.secrets:
-        info = json.loads(st.secrets["GCP_SA_KEY_JSON"])
-        return service_account.Credentials.from_service_account_info(info)
+        try:
+            try_sources.append(("st.secrets['GCP_SA_KEY_JSON']", json.loads(st.secrets["GCP_SA_KEY_JSON"])))
+        except Exception as e:
+            raise ValueError(f"GCP_SA_KEY_JSON in secrets is not valid JSON: {e}")
 
     # 3) Env var JSON string
     if os.getenv("GCP_SA_KEY_JSON"):
-        info = json.loads(os.environ["GCP_SA_KEY_JSON"])
-        return service_account.Credentials.from_service_account_info(info)
+        try:
+            try_sources.append(("env:GCP_SA_KEY_JSON", json.loads(os.environ["GCP_SA_KEY_JSON"])))
+        except Exception as e:
+            raise ValueError(f"env GCP_SA_KEY_JSON is not valid JSON: {e}")
 
     # 4) Env var file path
     if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-        return service_account.Credentials.from_service_account_file(
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
-        )
+        path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+        if not os.path.isfile(path):
+            raise ValueError(f"GOOGLE_APPLICATION_CREDENTIALS points to a non-existent file: {path}")
+        # Let the file loader handle PEM correctness
+        return service_account.Credentials.from_service_account_file(path)
+
+    # Try JSON/dict sources (with PEM cleanup)
+    for label, info in try_sources:
+        try:
+            info = _normalize_sa_info(info)
+            return service_account.Credentials.from_service_account_info(info)
+        except ValueError as e:
+            # Make PEM errors actionable
+            raise ValueError(
+                f"Failed to build credentials from {label}: {e}\n"
+                "Hint: paste the 'private_key' exactly as issued (use triple quotes in TOML/Streamlit)."
+            )
 
     raise ValueError(
         "No service account credentials found. Provide one of: "
@@ -74,12 +160,10 @@ def get_conn(cfg: dict, key: str):
       - ip_type: "PUBLIC" or "PRIVATE" (optional, default PUBLIC)
       - universe_domain: e.g. "googleapis.com" (optional; defaults connector)
     """
-    # Always pass explicit credentials to avoid metadata lookups off-GCP
     creds = _load_explicit_credentials()
 
     connector = Connector(
         credentials=creds,
-        # Set if you saw a "universe domain mismatch"; safe default is googleapis.com
         universe_domain=cfg.get("universe_domain", "googleapis.com"),
     )
 
@@ -96,38 +180,44 @@ def get_conn(cfg: dict, key: str):
             if str(cfg.get("ip_type", "PUBLIC")).upper() == "PRIVATE"
             else IPTypes.PUBLIC,
         )
-        # Per-session statement timeout (5s) so no query can hang the UI
         cur = conn.cursor()
         try:
+            # Short per-transaction timeouts to keep the UI responsive
             cur.execute("SET statement_timeout = 5000;")
+            cur.execute("SET idle_in_transaction_session_timeout = 5000;")
+            # Optional: tag connection
+            cur.execute("SET application_name = 'streamlit_app';")
         finally:
             cur.close()
         return conn
 
     conn = _connect()
 
-    # Clean up both connection and connector when the Streamlit session ends
+    # Cache cleanup is handled by Streamlit when the session ends; still guard explicit close.
+    def _cleanup():
+        try:
+            conn.close()
+        except Exception:
+            pass
+        try:
+            connector.close()
+        except Exception:
+            pass
+
+    # Streamlit may not always expose a hook; best-effort attach.
     try:
-        def _cleanup():
-            try:
-                conn.close()
-            except Exception:
-                pass
-            try:
-                connector.close()
-            except Exception:
-                pass
-        st.on_session_end(_cleanup)  # no-op on some hosts; guarded above
+        st.on_session_end(_cleanup)  # no-op on some hosts
     except Exception:
         pass
 
-    conn._cloudsql_connector = connector  # optional handle
+    # Keep a handle in case you want manual cleanup elsewhere
+    conn._cloudsql_connector = connector  # noqa: SLF001
     return conn
 
 
 # ───────────────────────────────────────────────────────────────
 # 2) Database manager with auto-reconnect logic
-# ───────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────
 class DatabaseManager:
     """General DB interactions using a cached connection (Cloud SQL Connector)."""
 
@@ -140,7 +230,7 @@ class DatabaseManager:
                 cloudsql.get("instance_connection_name", ""),
             ),
             "user": os.getenv("DB_USER", cloudsql.get("user", "")),
-            # Your password may include a double-quote; keep it raw.
+            # Your password may include % or "; keep it raw.
             "password": os.getenv("DB_PASSWORD", cloudsql.get("password", "")),
             "db": os.getenv("DB_NAME", cloudsql.get("db", "")),
             "ip_type": os.getenv("CLOUDSQL_IP_TYPE", cloudsql.get("ip_type", "PUBLIC")),
@@ -251,9 +341,7 @@ class DatabaseManager:
 
     # ─────────── Supplier Management ───────────
     def get_suppliers(self):
-        return self.fetch_data(
-            "SELECT supplierid, suppliername FROM supplier"
-        )
+        return self.fetch_data("SELECT supplierid, suppliername FROM supplier")
 
     # ─────────── Inventory Management ───────────
     def add_inventory(self, data: dict):
