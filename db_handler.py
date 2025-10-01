@@ -11,6 +11,9 @@ from google.cloud.sql.connector import Connector, IPTypes
 from google.oauth2 import service_account  # explicit creds for off-GCP
 import pg8000  # ensure driver is installed
 
+# Direct DSN path uses SQLAlchemy to connect to local/remote Postgres without Cloud SQL
+import sqlalchemy as sa
+
 
 # ───────────────────────────────────────────────────────────────
 # Helpers: session key
@@ -144,52 +147,112 @@ def _load_explicit_credentials():
 
 
 # ───────────────────────────────────────────────────────────────
-# 1) One cached Connector + connection per user session
+# DSN detection
+# ───────────────────────────────────────────────────────────────
+def _is_postgres_dsn(s: str) -> bool:
+    if not isinstance(s, str):
+        return False
+    s = s.strip().lower()
+    return s.startswith("postgresql://") or s.startswith("postgresql+psycopg2://") or s.startswith("postgresql+pg8000://")
+
+
+# ───────────────────────────────────────────────────────────────
+# 1) One cached connection per user session
+#    - If instance_connection_name is a DSN → direct SQLAlchemy (local PG)
+#    - Else → Cloud SQL Connector (pg8000)
 # ───────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def get_conn(cfg: dict, key: str):
     """
-    Create (once per session) and return a PostgreSQL connection using
-    the Cloud SQL Python Connector with the pg8000 driver.
+    Create (once per session) and return a PostgreSQL connection.
 
-    Expected cfg keys:
-      - instance_connection_name: "PROJECT:REGION:INSTANCE"
-      - user: DB user (e.g. "postgres")
-      - password: raw DB password (NO URL encoding)
-      - db: database name
-      - ip_type: "PUBLIC" or "PRIVATE" (optional, default PUBLIC)
-      - universe_domain: e.g. "googleapis.com" (optional; defaults connector)
+    Modes:
+      A) DSN mode (recommended for local/on-prem PG):
+         - cfg['instance_connection_name'] is a full DSN like:
+           'postgresql+psycopg2://user:pass@host:5432/dbname'
+         - Uses SQLAlchemy to create an engine and returns a raw DB-API connection.
+
+      B) Cloud SQL mode (GCP):
+         - cfg['instance_connection_name'] is 'PROJECT:REGION:INSTANCE'
+         - Uses Cloud SQL Python Connector with pg8000 driver.
+
+    The returned object conforms to Python DB-API (has .cursor(), .commit(), etc.).
     """
-    creds = _load_explicit_credentials()
+    dsn_or_icn = cfg["instance_connection_name"].strip()
 
+    # A) Direct DSN path
+    if _is_postgres_dsn(dsn_or_icn):
+        # Build the engine with a small connect timeout. psycopg2 understands 'connect_timeout'.
+        engine = sa.create_engine(
+            dsn_or_icn,
+            pool_pre_ping=True,
+            future=True,
+            connect_args={"connect_timeout": 10} if "+psycopg2" in dsn_or_icn or dsn_or_icn.startswith("postgresql://") else {},
+        )
+        # Materialize a DB-API connection
+        conn = engine.raw_connection()
+        cur = conn.cursor()
+        try:
+            # Keep the UI responsive
+            cur.execute("SET statement_timeout = 5000;")
+            cur.execute("SET idle_in_transaction_session_timeout = 5000;")
+            cur.execute("SET application_name = 'streamlit_app';")
+        finally:
+            cur.close()
+
+        # Cleanup handler
+        def _cleanup():
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+
+        try:
+            st.on_session_end(_cleanup)  # best-effort
+        except Exception:
+            pass
+
+        # Attach for optional manual cleanup
+        conn._engine = engine  # noqa: SLF001
+        return conn
+
+    # B) Cloud SQL path
+    creds = _load_explicit_credentials()
     connector = Connector(
         credentials=creds,
         universe_domain=cfg.get("universe_domain", "googleapis.com"),
     )
 
-    
-    def _connect():
-        dsn = cfg["instance_connection_name"]
-    
-        # If a full DSN is provided, connect directly with psycopg2 via SQLAlchemy
-        if dsn.startswith(("postgresql://", "postgresql+psycopg2://")):
-            # Use SQLAlchemy to manage the connection; return a DB-API connection object
-            engine = sa.create_engine(dsn, pool_pre_ping=True)
-            return engine.raw_connection()  # or: return engine.connect().connection
-    
-        # Otherwise fall back to Cloud SQL connector (original path)
+    def _connect_cloudsql():
         conn = connector.connect(
             cfg["instance_connection_name"],
             "pg8000",
             user=cfg["user"],
             password=cfg["password"],
             db=cfg["db"],
+            timeout=10,             # connect timeout (seconds)
+            enable_iam_auth=False,  # using DB password auth (not IAM DB Auth)
+            ip_type=IPTypes.PRIVATE
+            if str(cfg.get("ip_type", "PUBLIC")).upper() == "PRIVATE"
+            else IPTypes.PUBLIC,
         )
+        cur = conn.cursor()
+        try:
+            # Short per-transaction timeouts to keep the UI responsive
+            cur.execute("SET statement_timeout = 5000;")
+            cur.execute("SET idle_in_transaction_session_timeout = 5000;")
+            # Optional: tag connection
+            cur.execute("SET application_name = 'streamlit_app';")
+        finally:
+            cur.close()
         return conn
 
-    conn = _connect()
+    conn = _connect_cloudsql()
 
-    # Cache cleanup is handled by Streamlit when the session ends; still guard explicit close.
     def _cleanup():
         try:
             conn.close()
@@ -200,22 +263,20 @@ def get_conn(cfg: dict, key: str):
         except Exception:
             pass
 
-    # Streamlit may not always expose a hook; best-effort attach.
     try:
         st.on_session_end(_cleanup)  # no-op on some hosts
     except Exception:
         pass
 
-    # Keep a handle in case you want manual cleanup elsewhere
     conn._cloudsql_connector = connector  # noqa: SLF001
     return conn
 
 
 # ───────────────────────────────────────────────────────────────
 # 2) Database manager with auto-reconnect logic
-# ───────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
 class DatabaseManager:
-    """General DB interactions using a cached connection (Cloud SQL Connector)."""
+    """General DB interactions using a cached connection (DSN or Cloud SQL)."""
 
     def __init__(self):
         # Prefer env vars; fallback to Streamlit secrets.
@@ -236,8 +297,16 @@ class DatabaseManager:
             ),
         }
 
-        # Minimal validation
-        missing = [k for k in ("instance_connection_name", "user", "password", "db") if not cfg.get(k)]
+        # Minimal validation (DSN mode only needs instance_connection_name)
+        missing = []
+        if not _is_postgres_dsn(cfg["instance_connection_name"]):
+            for k in ("instance_connection_name", "user", "password", "db"):
+                if not cfg.get(k):
+                    missing.append(k)
+        else:
+            if not cfg["instance_connection_name"]:
+                missing.append("instance_connection_name")
+
         if missing:
             raise ValueError(f"Missing DB config values: {', '.join(missing)}")
 
