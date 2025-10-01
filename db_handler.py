@@ -167,28 +167,24 @@ def get_conn(cfg: dict, key: str):
         universe_domain=cfg.get("universe_domain", "googleapis.com"),
     )
 
+    
     def _connect():
+        dsn = cfg["instance_connection_name"]
+    
+        # If a full DSN is provided, connect directly with psycopg2 via SQLAlchemy
+        if dsn.startswith(("postgresql://", "postgresql+psycopg2://")):
+            # Use SQLAlchemy to manage the connection; return a DB-API connection object
+            engine = sa.create_engine(dsn, pool_pre_ping=True)
+            return engine.raw_connection()  # or: return engine.connect().connection
+    
+        # Otherwise fall back to Cloud SQL connector (original path)
         conn = connector.connect(
             cfg["instance_connection_name"],
             "pg8000",
             user=cfg["user"],
             password=cfg["password"],
             db=cfg["db"],
-            timeout=10,             # connect timeout (seconds)
-            enable_iam_auth=False,  # using DB password auth (not IAM DB Auth)
-            ip_type=IPTypes.PRIVATE
-            if str(cfg.get("ip_type", "PUBLIC")).upper() == "PRIVATE"
-            else IPTypes.PUBLIC,
         )
-        cur = conn.cursor()
-        try:
-            # Short per-transaction timeouts to keep the UI responsive
-            cur.execute("SET statement_timeout = 5000;")
-            cur.execute("SET idle_in_transaction_session_timeout = 5000;")
-            # Optional: tag connection
-            cur.execute("SET application_name = 'streamlit_app';")
-        finally:
-            cur.close()
         return conn
 
     conn = _connect()
