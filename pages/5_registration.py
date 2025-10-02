@@ -14,7 +14,7 @@ STATUS_FIELD = "enrollment_status"
 ALLOWED_STATUSES = ["pending", "accepted", "rejected"]
 
 # ───────────────────────────────────────────────────────────────
-# Helpers
+# Helpers (SELECT-only via db.fetch_data)
 # ───────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=120)
 def find_schema() -> str:
@@ -27,9 +27,7 @@ def find_schema() -> str:
         LIMIT 1
     """
     df = db.fetch_data(q, (TABLE,))
-    if df is None or df.empty:
-        return "public"
-    return df["table_schema"].iat[0]
+    return df["table_schema"].iat[0] if isinstance(df, pd.DataFrame) and not df.empty else "public"
 
 @st.cache_data(show_spinner=False, ttl=120)
 def get_primary_key(schema: str) -> List[str]:
@@ -45,22 +43,7 @@ def get_primary_key(schema: str) -> List[str]:
         ORDER BY kcu.ordinal_position
     """
     df = db.fetch_data(q, (schema, TABLE))
-    if df is None or df.empty:
-        return []
-    return df["column_name"].tolist()
-
-def safe_execute(sql: str, params: tuple | None = None):
-    """
-    Run a DML statement safely with DatabaseManager.
-    Uses fetch_data but discards results (since UPDATE/DELETE return nothing).
-    """
-    try:
-        _ = db.fetch_data(sql, params)
-    except Exception as e:
-        # some drivers complain about no results to fetch -> ignore
-        if "no results" in str(e).lower():
-            return
-        raise
+    return df["column_name"].tolist() if isinstance(df, pd.DataFrame) and not df.empty else []
 
 @st.cache_data(show_spinner=True, ttl=30)
 def load_preview(schema: str, status: str, limit: int) -> pd.DataFrame:
@@ -72,6 +55,45 @@ def load_preview(schema: str, status: str, limit: int) -> pd.DataFrame:
     sql += f' ORDER BY 1 LIMIT {int(limit)}'
     df = db.fetch_data(sql, params)
     return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+def update_single(schema: str, pk_col: str, pk_val, new_status: str) -> int:
+    """
+    Update one row but always return a tiny result set so fetch_data is satisfied.
+    """
+    sql = f'''
+        WITH upd AS (
+          UPDATE "{schema}"."{TABLE}"
+             SET "{STATUS_FIELD}" = %s
+           WHERE "{pk_col}" = %s
+         RETURNING 1
+        )
+        SELECT COUNT(*)::int AS affected FROM upd;
+    '''
+    df = db.fetch_data(sql, (new_status, pk_val))
+    if isinstance(df, pd.DataFrame) and not df.empty and "affected" in df.columns:
+        return int(df["affected"].iat[0])
+    return 0
+
+def update_bulk_ids(schema: str, pk_col: str, id_list: List, new_status: str) -> int:
+    """
+    Bulk update selected ids using ANY(array) and return affected count.
+    """
+    if not id_list:
+        return 0
+    sql = f'''
+        WITH upd AS (
+          UPDATE "{schema}"."{TABLE}" r
+             SET "{STATUS_FIELD}" = %s
+           WHERE r."{pk_col}" = ANY(%s)
+         RETURNING 1
+        )
+        SELECT COUNT(*)::int AS affected FROM upd;
+    '''
+    # psycopg2 will adapt Python list -> SQL array
+    df = db.fetch_data(sql, (new_status, id_list))
+    if isinstance(df, pd.DataFrame) and not df.empty and "affected" in df.columns:
+        return int(df["affected"].iat[0])
+    return 0
 
 # ───────────────────────────────────────────────────────────────
 # Main UI
@@ -98,45 +120,58 @@ if df.empty:
 st.dataframe(df, use_container_width=True, hide_index=True)
 
 # ───────────────────────────────────────────────────────────────
-# Bulk update
+# Bulk update (selected IDs)
 # ───────────────────────────────────────────────────────────────
 st.divider()
 st.subheader("Bulk update enrollment status")
 
-ids = st.multiselect("Select registrations by primary key", df[pk].tolist(), format_func=str)
-new_status = st.selectbox("New status", ALLOWED_STATUSES, index=0)
+ids = st.multiselect("Select registrations by primary key", df[pk].astype(str).tolist())
+# Keep the actual types for DB by mapping back (stringify for UI safety)
+ids_typed = [df.loc[df[pk].astype(str) == s, pk].iloc[0] for s in ids] if ids else []
+
+bulk_status = st.selectbox("New status for selected", ALLOWED_STATUSES, index=0)
 if st.button("✅ Apply to selected", type="primary"):
-    if not ids:
-        st.warning("Pick at least one registration.")
-    else:
-        try:
-            placeholders = ",".join(["%s"] * len(ids))
-            sql = f'UPDATE "{schema}"."{TABLE}" SET "{STATUS_FIELD}" = %s WHERE "{pk}" IN ({placeholders})'
-            params = tuple([new_status] + ids)
-            safe_execute(sql, params)
-            load_preview.clear()
-            st.success(f"Updated {len(ids)} row(s) to '{new_status}'.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Bulk update failed: {e}")
+    try:
+        affected = update_bulk_ids(schema, pk, ids_typed, bulk_status)
+        load_preview.clear()
+        st.success(f"Updated {affected} row(s) to '{bulk_status}'.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Bulk update failed: {e}")
 
 # ───────────────────────────────────────────────────────────────
-# Single update
+# Bulk apply to all in current preview
+# ───────────────────────────────────────────────────────────────
+st.caption("Or apply to *all rows currently shown* in the preview above.")
+preview_status = st.selectbox("New status for all in preview", ALLOWED_STATUSES, index=0, key="preview_status")
+if st.button("⚡ Apply to all in preview"):
+    try:
+        preview_ids = df[pk].tolist()
+        affected = update_bulk_ids(schema, pk, preview_ids, preview_status)
+        load_preview.clear()
+        st.success(f"Updated {affected} previewed row(s) to '{preview_status}'.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Bulk (preview) update failed: {e}")
+
+# ───────────────────────────────────────────────────────────────
+# Single-row update
 # ───────────────────────────────────────────────────────────────
 st.divider()
 st.subheader("Single update (by primary key)")
 
-sel_pk = st.selectbox("Pick registration", df[pk].tolist(), format_func=str)
-cur_status = df.loc[df[pk] == sel_pk, STATUS_FIELD].iat[0]
-st.metric("Current status", cur_status)
+sel_pk_str = st.selectbox("Pick registration", df[pk].astype(str).tolist())
+sel_pk_val = df.loc[df[pk].astype(str) == sel_pk_str, pk].iloc[0]
+cur_status = df.loc[df[pk].astype(str) == sel_pk_str, STATUS_FIELD].iloc[0]
 
-new_status_single = st.selectbox("Set status to", ALLOWED_STATUSES, index=ALLOWED_STATUSES.index(cur_status))
+st.metric("Current status", str(cur_status))
+single_status = st.selectbox("Set status to", ALLOWED_STATUSES, index=ALLOWED_STATUSES.index(str(cur_status)))
+
 if st.button("Update this row only"):
     try:
-        sql = f'UPDATE "{schema}"."{TABLE}" SET "{STATUS_FIELD}" = %s WHERE "{pk}" = %s'
-        safe_execute(sql, (new_status_single, sel_pk))
+        affected = update_single(schema, pk, sel_pk_val, single_status)
         load_preview.clear()
-        st.success(f"Row {sel_pk} updated to '{new_status_single}'.")
+        st.success(f"Row {sel_pk_str} updated to '{single_status}' (affected={affected}).")
         st.rerun()
     except Exception as e:
         st.error(f"Update failed: {e}")
