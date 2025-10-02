@@ -4,6 +4,7 @@ pandas
 
 # Direct psycopg2 import in pages/1_Create_Database.py (use wheel to avoid pg_config issues)
 psycopg2-binary>=2.9.10
+psycopg[binary,pool]==3.2.10
 
 # Cloud SQL connector stack used by DatabaseManager (pg8000 driver)
 cloud-sql-python-connector[pg8000]>=1.11.1
