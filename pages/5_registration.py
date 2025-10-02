@@ -4,10 +4,10 @@ import streamlit as st
 import pandas as pd
 from typing import List, Any, Optional, Tuple
 
-from db_handler import DatabaseManager  # read-only usage
+from db_handler import DatabaseManager  # read-only
 
 st.set_page_config(page_title="Registrations — Enrollment Status", layout="wide")
-st.title("📝 Registrations — Enrollment Status (safe writer)")
+st.title("📝 Registrations — Enrollment Status (resilient writer)")
 
 # ───────────────────────────────────────────────────────────────
 # Config
@@ -16,92 +16,125 @@ TABLE = "registrations"
 STATUS_FIELD = "enrollment_status"
 ALLOWED_STATUSES = ["pending", "accepted", "rejected"]
 
-# Instantiate once (reads only)
-db = DatabaseManager()
+db = DatabaseManager()  # reads only
 
 # ───────────────────────────────────────────────────────────────
-# Low-level safe writer (NO pooling, autocommit, short-lived)
+# WRITE LAYER — short-lived connection, multiple fallbacks
 # ───────────────────────────────────────────────────────────────
-def _get_db_url() -> Optional[str]:
-    # Prefer DATABASE_URL; fallbacks if you use separate parts
-    url = os.getenv("DATABASE_URL") or os.getenv("DB_URL") or ""
-    return url.strip() or None
+def _env(k: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(k)
+    if v is None or str(v).strip() == "":
+        return default
+    return str(v).strip()
+
+def _get_basic_creds():
+    # prefer DB_* then PG_*
+    user = _env("DB_USER") or _env("PGUSER")
+    password = _env("DB_PASS") or _env("PGPASSWORD")
+    database = _env("DB_NAME") or _env("PGDATABASE")
+    host = _env("DB_HOST") or _env("PGHOST") or "localhost"
+    port = int(_env("DB_PORT") or _env("PGPORT") or "5432")
+    return user, password, database, host, port
 
 def _exec_write(sql: str, params: Tuple[Any, ...]) -> int:
     """
-    Execute a write with a dedicated, autocommit connection.
-    Returns affected row count using RETURNING wrapper, so callers get a number.
-    Tries psycopg2 first, then pg8000. Never touches SQLAlchemy / pooled conns.
+    Run a write and return affected row count using a tiny SELECT wrapper.
+    Tries:
+      1) psycopg2 with DATABASE_URL (if set)
+      2) pg8000 with basic creds (DB_* / PG_*)
+      3) Cloud SQL Connector (INSTANCE_CONNECTION_NAME + DB_USER/DB_PASS/DB_NAME)
     """
-    # psycopg2 path
-    try:
-        import psycopg2
-        from psycopg2.extras import RealDictCursor
-        db_url = _get_db_url()
-        if db_url:
-            conn = psycopg2.connect(db_url, connect_timeout=10)
-        else:
-            # If you use discrete vars (PGHOST, PGPORT, etc.)
-            conn = psycopg2.connect(
-                host=os.getenv("PGHOST", "localhost"),
-                port=int(os.getenv("PGPORT", "5432")),
-                user=os.getenv("PGUSER"),
-                password=os.getenv("PGPASSWORD"),
-                dbname=os.getenv("PGDATABASE"),
-                connect_timeout=10,
-            )
-        conn.autocommit = True
+    # 1) psycopg2 with DATABASE_URL
+    db_url = _env("DATABASE_URL") or _env("DB_URL")
+    if db_url:
         try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(sql, params)
-                row = cur.fetchone()
-                return int(row["affected"]) if row and "affected" in row else 0
-        finally:
-            conn.close()
-    except Exception:
-        pass  # fall back to pg8000
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+            conn = psycopg2.connect(db_url, connect_timeout=10)
+            conn.autocommit = True
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(sql, params)
+                    row = cur.fetchone()
+                    return int(row["affected"]) if row and "affected" in row else 0
+            finally:
+                conn.close()
+        except Exception:
+            pass  # fall through
 
-    # pg8000 path (pure python)
+    # 2) pg8000 with basic creds
     try:
         import pg8000.native as pg
-        db_url = _get_db_url()
-        if db_url:
-            # Minimal parser for URL → kwargs
-            # Expecting postgresql://user:pass@host:port/dbname
-            from urllib.parse import urlparse
-            u = urlparse(db_url)
-            kwargs = {
-                "user": u.username,
-                "password": u.password,
-                "host": u.hostname,
-                "port": u.port or 5432,
-                "database": (u.path or "/").lstrip("/"),
-                "timeout": 10,
-            }
-        else:
-            kwargs = {
-                "user": os.getenv("PGUSER"),
-                "password": os.getenv("PGPASSWORD"),
-                "host": os.getenv("PGHOST", "localhost"),
-                "port": int(os.getenv("PGPORT", "5432")),
-                "database": os.getenv("PGDATABASE"),
-                "timeout": 10,
-            }
-        conn = pg.Connection(**kwargs)
-        try:
-            # pg8000 returns a list of tuples by default; we SELECT an int
-            res = conn.run(sql, params)
-            # res is a list of rows; each row is a tuple, first col is affected
-            if res and len(res[0]) >= 1:
-                return int(res[0][0])
-            return 0
-        finally:
-            conn.close()
-    except Exception as e:
-        # Surface a concise error to the UI
-        raise RuntimeError(f"Write failed (no driver usable): {e}")
+        user, password, database, host, port = _get_basic_creds()
+        if user and database:
+            conn = pg.Connection(
+                user=user,
+                password=password,
+                host=host,
+                port=port,
+                database=database,
+                timeout=10,
+            )
+            try:
+                res = conn.run(sql, params)  # returns list of tuples
+                if res and len(res[0]) >= 1:
+                    return int(res[0][0])
+                return 0
+            finally:
+                conn.close()
+    except Exception:
+        pass  # fall through
 
-# Wrap any UPDATE so it always returns a tiny rowset (affected count)
+    # 3) Cloud SQL Connector (pg8000)
+    try:
+        from google.cloud.sql.connector import Connector
+        import pg8000  # dbapi variant used by connector
+        instance = _env("INSTANCE_CONNECTION_NAME")
+        user = _env("DB_USER") or _env("PGUSER")
+        password = _env("DB_PASS") or _env("PGPASSWORD")
+        database = _env("DB_NAME") or _env("PGDATABASE")
+        if instance and user and database is not None:
+            with Connector() as connector:
+                conn = connector.connect(
+                    instance,
+                    "pg8000",
+                    user=user,
+                    password=password,
+                    db=database,
+                )
+                try:
+                    # dbapi cursor
+                    cur = conn.cursor()
+                    cur.execute(sql, params)
+                    row = cur.fetchone()
+                    cur.close()
+                    # some drivers return tuple, first column is affected
+                    if row is None:
+                        return 0
+                    if isinstance(row, tuple):
+                        return int(row[0])
+                    # dict-like fallback
+                    return int(row.get("affected", 0))
+                finally:
+                    conn.close()
+    except Exception as e:
+        # Surface the final error with a clear hint of what's missing
+        missing = []
+        if not db_url:
+            # only complain about creds if URL not provided
+            u, p, d, h, po = _get_basic_creds()
+            if not u: missing.append("DB_USER/PGUSER")
+            if d is None: missing.append("DB_NAME/PGDATABASE")
+        icn = _env("INSTANCE_CONNECTION_NAME")
+        if not db_url and not icn:
+            missing.append("INSTANCE_CONNECTION_NAME (for Cloud SQL)")
+        hint = f"Missing config: {', '.join(missing)}" if missing else str(e)
+        raise RuntimeError(f"Write failed (no driver usable): {hint}")
+
+    # If all 3 paths failed silently (shouldn't), raise a clear error
+    raise RuntimeError("Write failed: no usable connection method (DATABASE_URL / DB_* or Cloud SQL).")
+
+# Always wrap UPDATE so we SELECT an 'affected' count
 def write_update_single(schema: str, pk_col: str, pk_val: Any, new_status: str) -> int:
     sql = f'''
         WITH upd AS (
@@ -126,7 +159,6 @@ def write_update_ids(schema: str, pk_col: str, ids: List[Any], new_status: str) 
         )
         SELECT COUNT(*)::int AS affected FROM upd
     '''
-    # psycopg2 adapts list → array; pg8000 also accepts Python list for ANY(%s)
     return _exec_write(sql, (new_status, ids))
 
 def write_update_filter(schema: str, from_status: str, to_status: str) -> int:
@@ -142,7 +174,7 @@ def write_update_filter(schema: str, from_status: str, to_status: str) -> int:
     return _exec_write(sql, (to_status, from_status))
 
 # ───────────────────────────────────────────────────────────────
-# Read helpers (via DatabaseManager, safe)
+# READ HELPERS (DatabaseManager)
 # ───────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=120)
 def find_schema_for_table(table_name: str) -> str:
@@ -172,9 +204,7 @@ def get_primary_key(schema: str, table: str) -> List[str]:
         ORDER BY kcu.ordinal_position
     """
     df = db.fetch_data(q, (schema, table))
-    if isinstance(df, pd.DataFrame) and not df.empty:
-        return df["column_name"].tolist()
-    return []
+    return df["column_name"].tolist() if isinstance(df, pd.DataFrame) and not df.empty else []
 
 @st.cache_data(show_spinner=False, ttl=120)
 def status_column_exists(schema: str, table: str, col: str) -> bool:
@@ -212,7 +242,7 @@ def count_by_status(schema: str) -> pd.DataFrame:
     return df
 
 # ───────────────────────────────────────────────────────────────
-# UI: metadata + preview
+# UI
 # ───────────────────────────────────────────────────────────────
 schema = find_schema_for_table(TABLE)
 pk_cols = get_primary_key(schema, TABLE)
@@ -267,7 +297,7 @@ st.download_button(
 pk_options: List[Any] = pd.Series(df[pk]).dropna().astype(object).unique().tolist()
 
 # ───────────────────────────────────────────────────────────────
-# Bulk update — selected IDs
+# Bulk update — selected
 # ───────────────────────────────────────────────────────────────
 st.divider()
 st.subheader("Bulk update — selected")
@@ -292,7 +322,7 @@ if st.button("✅ Apply to selected", type="primary"):
             st.error(f"Bulk update failed: {e}")
 
 # ───────────────────────────────────────────────────────────────
-# Bulk update — all in preview / all matching filter
+# Bulk update — all in preview / all in DB filter
 # ───────────────────────────────────────────────────────────────
 st.subheader("Bulk update — quick apply")
 
@@ -325,7 +355,7 @@ with col_q2:
                 st.error(f"Bulk (filter) update failed: {e}")
 
 # ───────────────────────────────────────────────────────────────
-# Single-row update
+# Single update
 # ───────────────────────────────────────────────────────────────
 st.divider()
 st.subheader("Single update")
