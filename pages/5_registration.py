@@ -49,16 +49,18 @@ def get_primary_key(schema: str) -> List[str]:
         return []
     return df["column_name"].tolist()
 
-def execute_sql(sql: str, params: tuple | None = None):
-    """Run DML safely, no fetch afterwards."""
-    if hasattr(db, "execute"):
-        return db.execute(sql, params)  # type: ignore
-    else:
-        # fallback: use raw connection if DatabaseManager exposes it
-        conn = db._conn  # type: ignore[attr-defined]
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-        conn.commit()
+def safe_execute(sql: str, params: tuple | None = None):
+    """
+    Run a DML statement safely with DatabaseManager.
+    Uses fetch_data but discards results (since UPDATE/DELETE return nothing).
+    """
+    try:
+        _ = db.fetch_data(sql, params)
+    except Exception as e:
+        # some drivers complain about no results to fetch -> ignore
+        if "no results" in str(e).lower():
+            return
+        raise
 
 @st.cache_data(show_spinner=True, ttl=30)
 def load_preview(schema: str, status: str, limit: int) -> pd.DataFrame:
@@ -111,7 +113,7 @@ if st.button("✅ Apply to selected", type="primary"):
             placeholders = ",".join(["%s"] * len(ids))
             sql = f'UPDATE "{schema}"."{TABLE}" SET "{STATUS_FIELD}" = %s WHERE "{pk}" IN ({placeholders})'
             params = tuple([new_status] + ids)
-            execute_sql(sql, params)
+            safe_execute(sql, params)
             load_preview.clear()
             st.success(f"Updated {len(ids)} row(s) to '{new_status}'.")
             st.rerun()
@@ -119,7 +121,7 @@ if st.button("✅ Apply to selected", type="primary"):
             st.error(f"Bulk update failed: {e}")
 
 # ───────────────────────────────────────────────────────────────
-# Single update (for reference)
+# Single update
 # ───────────────────────────────────────────────────────────────
 st.divider()
 st.subheader("Single update (by primary key)")
@@ -132,7 +134,7 @@ new_status_single = st.selectbox("Set status to", ALLOWED_STATUSES, index=ALLOWE
 if st.button("Update this row only"):
     try:
         sql = f'UPDATE "{schema}"."{TABLE}" SET "{STATUS_FIELD}" = %s WHERE "{pk}" = %s'
-        execute_sql(sql, (new_status_single, sel_pk))
+        safe_execute(sql, (new_status_single, sel_pk))
         load_preview.clear()
         st.success(f"Row {sel_pk} updated to '{new_status_single}'.")
         st.rerun()
