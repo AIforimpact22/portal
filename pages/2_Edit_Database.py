@@ -127,6 +127,17 @@ def _reset_timeouts(cur):
     cur.execute("RESET lock_timeout;")
     cur.execute("RESET statement_timeout;")
 
+
+def _safe_rollback():
+    try:
+        db.conn.rollback()
+    except Exception:
+        try:
+            db._reconnect()
+        except Exception:
+            pass
+
+
 def _pg8000_err_to_text(e: Exception) -> str:
     try:
         first = e.args[0]
@@ -271,7 +282,7 @@ if st.button("Run SQL"):
                                 in_txn=True,
                             )
                         except Exception as e:
-                            db.conn.rollback()
+                            _safe_rollback()
                             st.error(_pg8000_err_to_text(e))
                             st.warning("Transaction rolled back due to the error above.")
                             st.stop()
@@ -307,7 +318,7 @@ if st.button("Run SQL"):
                         )
                         db.conn.commit()
                     except Exception as e:
-                        db.conn.rollback()
+                        _safe_rollback()
                         st.error(_pg8000_err_to_text(e))
                         continue
 
