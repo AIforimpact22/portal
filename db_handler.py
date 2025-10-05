@@ -333,6 +333,15 @@ class DatabaseManager:
                 _ = cur.fetchone()
             finally:
                 cur.close()
+            try:
+                # End the implicit transaction opened by the ping so the
+                # server doesn't terminate the session for idling in a
+                # transaction block.
+                self.conn.rollback()
+            except Exception:
+                # Some drivers complain if there's nothing to roll back;
+                # we only care that the connection is left clean.
+                pass
         except Exception:
             self._reconnect()
 
